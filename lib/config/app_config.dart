@@ -3,7 +3,7 @@ class AppConfig {
   static const bool showEmergencyInfo = true;
 
   static const int maxResults = 8;
-  static const double searchRadiusMeters = 8000;
+  static const double searchRadiusMeters = 5000;
 
   // Used when GPS is unavailable (centre of Hyderabad).
   static const double fallbackLat = 17.385;
