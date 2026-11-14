@@ -70,7 +70,7 @@ class PlacesService {
     final filters = types
         .map((t) => '  nwr["amenity"="$t"](around:$radius,$lat,$lng);')
         .join('\n');
-    final query = '[out:json][timeout:20];\n(\n$filters\n);\nout center 80;';
+    final query = '[out:json][timeout:30];\n(\n$filters\n);\nout center 80;';
 
     Object? lastError;
     for (final url in [AppConfig.overpassUrl, AppConfig.overpassFallbackUrl]) {
@@ -81,7 +81,7 @@ class PlacesService {
               headers: {'User-Agent': AppConfig.userAgent},
               body: {'data': query},
             )
-            .timeout(const Duration(seconds: 25));
+            .timeout(const Duration(seconds: 35));
         if (res.statusCode != 200) {
           throw ApiException.fromResponse(
               'Hospital search', res.statusCode, res.body);
@@ -127,7 +127,7 @@ class RoutesService {
   Future<Map<String, dynamic>> _get(String path) async {
     final res = await http
         .get(Uri.parse('${AppConfig.osrmBaseUrl}$path'), headers: _headers)
-        .timeout(const Duration(seconds: 20));
+        .timeout(const Duration(seconds: 30));
     if (res.statusCode != 200) {
       throw ApiException.fromResponse('Routing', res.statusCode, res.body);
     }
