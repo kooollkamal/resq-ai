@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../config/app_config.dart';
 import '../models/facility.dart';
 
@@ -60,7 +61,75 @@ List<LatLng> decodePolyline(String encoded) {
   return points;
 }
 
+String _encodeNumber(int v) {
+  var n = v < 0 ? ~(v << 1) : (v << 1);
+  final sb = StringBuffer();
+  while (n >= 0x20) {
+    sb.writeCharCode((0x20 | (n & 0x1f)) + 63);
+    n >>= 5;
+  }
+  sb.writeCharCode(n + 63);
+  return sb.toString();
+}
+
+String encodePolyline(List<LatLng> pts) {
+  final sb = StringBuffer();
+  var prevLat = 0, prevLng = 0;
+  for (final p in pts) {
+    final la = (p.latitude * 1e5).round();
+    final ln = (p.longitude * 1e5).round();
+    sb.write(_encodeNumber(la - prevLat));
+    sb.write(_encodeNumber(ln - prevLng));
+    prevLat = la;
+    prevLng = ln;
+  }
+  return sb.toString();
+}
+
+// Used when the routing server cannot be reached: straight-line distance
+// times 1.3, at an average city speed of about 25 km/h.
+RouteInfo _offlineEstimate(
+    double lat1, double lng1, double lat2, double lng2,
+    {bool withLine = false}) {
+  final meters = (haversineMeters(lat1, lng1, lat2, lng2) * 1.3).round();
+  final seconds = (meters / 6.9).round();
+  return RouteInfo(
+    durationSeconds: seconds,
+    distanceMeters: meters,
+    encodedPolyline: withLine
+        ? encodePolyline([LatLng(lat1, lng1), LatLng(lat2, lng2)])
+        : '',
+  );
+}
+
 class PlacesService {
+  static const _cachePrefix = 'places_cache_v1_';
+
+  Future<void> _saveCache(
+      String type, double lat, double lng, String body) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+          '$_cachePrefix$type',
+          jsonEncode({'lat': lat, 'lng': lng, 'body': body}));
+    } catch (_) {}
+  }
+
+  Future<String?> _loadCache(String type, double lat, double lng) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('$_cachePrefix$type');
+      if (raw == null) return null;
+      final m = jsonDecode(raw) as Map<String, dynamic>;
+      final d = haversineMeters(lat, lng, (m['lat'] as num).toDouble(),
+          (m['lng'] as num).toDouble());
+      if (d > 30000) return null;
+      return m['body'] as String;
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<List<Facility>> nearby({
     required double lat,
     required double lng,
@@ -86,10 +155,19 @@ class PlacesService {
           throw ApiException.fromResponse(
               'Hospital search', res.statusCode, res.body);
         }
-        return _parse(res.body, lat, lng, types.first);
+        final list = _parse(res.body, lat, lng, types.first);
+        if (list.isNotEmpty) {
+          await _saveCache(types.first, lat, lng, res.body);
+        }
+        return list;
       } catch (e) {
         lastError = e;
       }
+    }
+
+    final cached = await _loadCache(types.first, lat, lng);
+    if (cached != null) {
+      return _parse(cached, lat, lng, types.first);
     }
     throw lastError ?? ApiException('Hospital search failed.');
   }
@@ -143,33 +221,41 @@ class RoutesService {
     required double fromLng,
     required List<Facility> targets,
   }) async {
-    final coords = [
-      '$fromLng,$fromLat',
-      for (final t in targets) '${t.lng},${t.lat}',
-    ].join(';');
-    final data = await _get(
-        '/table/v1/driving/$coords?sources=0&annotations=duration,distance');
+    try {
+      final coords = [
+        '$fromLng,$fromLat',
+        for (final t in targets) '${t.lng},${t.lat}',
+      ].join(';');
+      final data = await _get(
+          '/table/v1/driving/$coords?sources=0&annotations=duration,distance');
 
-    final durs = (data['durations'] as List).first as List;
-    final dists =
-        data['distances'] == null ? null : (data['distances'] as List).first as List;
+      final durs = (data['durations'] as List).first as List;
+      final dists = data['distances'] == null
+          ? null
+          : (data['distances'] as List).first as List;
 
-    return [
-      for (var i = 0; i < targets.length; i++)
-        if (durs[i + 1] == null)
-          null
-        else
-          RouteInfo(
-            durationSeconds: (durs[i + 1] as num).round(),
-            distanceMeters: (dists != null && dists[i + 1] != null)
-                ? (dists[i + 1] as num).round()
-                : (haversineMeters(fromLat, fromLng, targets[i].lat,
-                            targets[i].lng) *
-                        1.3)
-                    .round(),
-            encodedPolyline: '',
-          ),
-    ];
+      return [
+        for (var i = 0; i < targets.length; i++)
+          if (durs[i + 1] == null)
+            null
+          else
+            RouteInfo(
+              durationSeconds: (durs[i + 1] as num).round(),
+              distanceMeters: (dists != null && dists[i + 1] != null)
+                  ? (dists[i + 1] as num).round()
+                  : (haversineMeters(fromLat, fromLng, targets[i].lat,
+                              targets[i].lng) *
+                          1.3)
+                      .round(),
+              encodedPolyline: '',
+            ),
+      ];
+    } catch (_) {
+      return [
+        for (final t in targets)
+          _offlineEstimate(fromLat, fromLng, t.lat, t.lng),
+      ];
+    }
   }
 
   Future<List<RouteInfo>> drive({
@@ -179,17 +265,23 @@ class RoutesService {
     required double toLng,
     bool alternatives = false,
   }) async {
-    final data = await _get(
-        '/route/v1/driving/$fromLng,$fromLat;$toLng,$toLat'
-        '?overview=full&geometries=polyline&alternatives=$alternatives');
-    final routes = (data['routes'] as List?) ?? const [];
-    return [
-      for (final r in routes)
-        RouteInfo(
-          durationSeconds: ((r as Map)['duration'] as num).round(),
-          distanceMeters: (r['distance'] as num).round(),
-          encodedPolyline: r['geometry'] as String,
-        ),
-    ];
+    try {
+      final data = await _get(
+          '/route/v1/driving/$fromLng,$fromLat;$toLng,$toLat'
+          '?overview=full&geometries=polyline&alternatives=$alternatives');
+      final routes = (data['routes'] as List?) ?? const [];
+      return [
+        for (final r in routes)
+          RouteInfo(
+            durationSeconds: ((r as Map)['duration'] as num).round(),
+            distanceMeters: (r['distance'] as num).round(),
+            encodedPolyline: r['geometry'] as String,
+          ),
+      ];
+    } catch (_) {
+      return [
+        _offlineEstimate(fromLat, fromLng, toLat, toLng, withLine: true),
+      ];
+    }
   }
 }
